@@ -18,6 +18,11 @@ from dbfread import DBF
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 PRICE_TYPE_ID = "N"  # VIP price in SC203/SC377
+ALLOWED_GROUPS = {
+    "Вафли", "Вода, Сок", "Драже", "Зефир, Птичье молоко", "Конфеты",
+    "Крекер, Галеты, Соломка, Хлебцы", "Мармелад", "Печенье", "Пряники",
+    "Сухари, Сушка, Луковые кольца",
+}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -45,6 +50,7 @@ class Product:
     group: str
     price: float | None
     photo: Path | None
+    stock: float
 
 
 class Catalog:
@@ -60,7 +66,10 @@ class Catalog:
         types_path = self.db_dir / "SC203.DBF"
         if not products_path.exists():
             raise FileNotFoundError(f"Не найден {products_path}")
-        products = list(DBF(str(products_path), encoding="cp1251", ignore_missing_memofile=True, char_decode_errors="replace"))
+        table = DBF(str(products_path), encoding="cp1251", ignore_missing_memofile=True, char_decode_errors="replace")
+        if not any(f.name == "SP1113" and f.type == "N" for f in table.fields):
+            raise ValueError("В SC354.DBF не найдено числовое поле остатка SP1113. Экспорт остановлен.")
+        products = list(table)
         prices = list(DBF(str(prices_path), encoding="cp1251", ignore_missing_memofile=True, char_decode_errors="replace")) if prices_path.exists() else []
         price_types = {clean(r["ID"]): clean(r["DESCR"]) for r in DBF(str(types_path), encoding="cp1251", ignore_missing_memofile=True, char_decode_errors="replace")} if types_path.exists() else {}
         if PRICE_TYPE_ID not in price_types:
@@ -72,10 +81,11 @@ class Catalog:
             seen = set()
             while parent and parent not in seen:
                 seen.add(parent)
-                if parent in groups_by_id:
-                    return groups_by_id[parent]
+                name = re.sub(r",\s*", ", ", groups_by_id.get(parent, ""))
+                if name in ALLOWED_GROUPS:
+                    return name
                 parent = parent_by_id.get(parent, "")
-            return "Без группы"
+            return None
 
         price_by_product = {}
         for r in prices:
@@ -89,10 +99,15 @@ class Catalog:
 
         self.products = []
         for r in products:
-            if r.get("ISFOLDER") != 2:
+            if r.get("ISFOLDER") != 2 or clean(r.get("ISMARK")):
                 continue
             code = clean(r["CODE"])
-            self.products.append(Product(code, clean(r["DESCR"]), clean(r["PARENTID"]), clean(r["ID"]), group_name(clean(r["PARENTID"])), price_by_product.get(clean(r["ID"])), photos.get(code.lower())))
+            parent = clean(r["PARENTID"])
+            group = group_name(parent)
+            stock = r["SP1113"]
+            if not code or not group or stock is None or not stock > 0:
+                continue
+            self.products.append(Product(code, clean(r["DESCR"]), parent, clean(r["ID"]), group, price_by_product.get(clean(r["ID"])), photos.get(code.lower()), stock))
         self.groups = sorted({p.group for p in self.products}, key=str.casefold)
 
 
@@ -112,6 +127,8 @@ def wrap_text(draw, text, fnt, max_width):
 
 
 def render_card(product: Product, out: Path, width=1080):
+    if not product.stock > 0:
+        raise ValueError("нет положительного остатка")
     if not product.photo:
         raise ValueError("нет фото")
     photo = Image.open(product.photo).convert("RGB")
@@ -138,7 +155,7 @@ def render_card(product: Product, out: Path, width=1080):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Карточки товаров 1С - тест")
+        self.title("Карточки товаров 1С — только в наличии")
         self.geometry("1100x720")
         self.catalog = None
         self.group_vars = {}
@@ -187,15 +204,19 @@ class App(tk.Tk):
         if p: self.photo_dir.set(p)
     def load_catalog(self):
         try:
+            picked_groups = {g for g, v in self.group_vars.items() if v.get()}
             self.catalog = Catalog(Path(self.db_dir.get()), Path(self.photo_dir.get()))
             for w in self.groups_frame.winfo_children(): w.destroy()
             self.group_vars = {}
             for g in self.catalog.groups:
-                v = tk.BooleanVar(value=False); self.group_vars[g] = v
+                v = tk.BooleanVar(value=g in picked_groups); self.group_vars[g] = v
                 ttk.Checkbutton(self.groups_frame, text=g, variable=v, command=self.apply_filter).pack(anchor="w")
             self.refresh_manufacturers(); self.apply_filter()
-            self.status.set(f"Товаров: {len(self.catalog.products)}")
         except Exception as e:
+            self.catalog = None
+            self.filtered = []
+            self.listbox.delete(0, "end")
+            self.status.set("Каталог не обновлён")
             messagebox.showerror("Не удалось обновить", str(e))
 
     def set_groups(self, value):
@@ -213,21 +234,22 @@ class App(tk.Tk):
         selected = {g for g, v in self.group_vars.items() if v.get()}
         q = self.search.get().strip().casefold()
         maker = self.manufacturer.get() if self.manufacturer_filter.get() else "Все"
-        self.filtered = [p for p in self.catalog.products if (not selected or p.group in selected) and (not q or q in p.name.casefold() or q in p.code.casefold()) and (maker == "Все" or self.manufacturer_name(p.name) == maker)]
+        self.filtered = [p for p in self.catalog.products if p.group in selected and (not q or q in p.name.casefold() or q in p.code.casefold()) and (maker == "Все" or self.manufacturer_name(p.name) == maker)]
         self.listbox.delete(0, "end")
         for p in self.filtered:
             state = "фото OK" if p.photo else "НЕТ ФОТО"
             price = "цена OK" if p.price is not None else "НЕТ ЦЕНЫ"
-            self.listbox.insert("end", f"[{state}; {price}] {p.code} | {p.name}")
-        self.status.set(f"Показано: {len(self.filtered)}")
+            self.listbox.insert("end", f"[{state}; {price}] {p.code} | {p.name} | остаток: {p.stock:g}")
+        self.status.set(f"В наличии: {len(self.filtered)}" if selected else "Отметьте нужные группы")
     def generate_all(self): self.generate(indices=range(len(self.filtered)))
     def generate(self, indices=None):
         if not self.catalog: return
         if indices is None: indices = self.listbox.curselection()
         chosen = [self.filtered[i] for i in indices]
         if not chosen: return messagebox.showinfo("Карточки", "Сначала выберите товары или группу")
-        out = Path(filedialog.askdirectory(title="Куда сохранить карточки") or "")
-        if not out: return
+        folder = filedialog.askdirectory(title="Куда сохранить карточки")
+        if not folder: return
+        out = Path(folder)
         made = missing_photo = 0
         for p in chosen:
             if not p.photo: missing_photo += 1; continue
